@@ -1,0 +1,4 @@
+# ~/.local/bin/cc on this machine is a shell-script shim that breaks linking;
+# point cargo at the real Apple clang.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
