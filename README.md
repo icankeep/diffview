@@ -9,9 +9,26 @@ terminal session, then runs `diffview-tui` inside it.
 
 ## Install
 
+### Homebrew
+
 ```bash
 brew tap icankeep/diffview
 brew install diffview
+```
+
+### curl
+
+Downloads a prebuilt binary for your platform (macOS arm64/x86_64, Linux
+arm64/x86_64) into `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/icankeep/diffview/main/install.sh | sh
+```
+
+### From source
+
+```bash
+cargo install --git https://github.com/icankeep/diffview
 ```
 
 ## First Use

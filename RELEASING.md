@@ -30,9 +30,31 @@ Then run:
 diffview .
 ```
 
+## Prebuilt binaries (curl install)
+
+Binaries are built by `.github/workflows/release.yml`. The workflow runs from
+the default branch when a GitHub Release is **published** (or via manual
+`workflow_dispatch` with a tag), checks out the tagged code, and uploads
+`diffview-<target>.tar.gz` assets for:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+To cut a release with binaries:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0   # if not already pushed
+gh release create v0.1.0 --generate-notes   # publishing triggers the build
+```
+
+`install.sh` downloads the matching asset from the latest release.
+
 ## Homebrew Formula
 
-The draft formula is in `Formula/diffview.rb`.
+The formula is in `Formula/diffview.rb` and is published to the
+`icankeep/homebrew-diffview` tap.
 
 Before publishing:
 
