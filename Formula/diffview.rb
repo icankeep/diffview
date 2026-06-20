@@ -1,8 +1,8 @@
 class Diffview < Formula
   desc "Open an IDE-style side-by-side git diff viewer in your terminal"
   homepage "https://github.com/icankeep/diffview"
-  url "https://github.com/icankeep/diffview/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "d49e8d339138583d9008967e04c024427875d56e932f410bdb0bdb98600f2fde"
+  url "https://github.com/icankeep/diffview/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "dd2f767a63acaa53798b284cf6bcd7fd5e8c38cc14dd6fd9c9a9e5b14b15d35c"
   license "MIT"
 
   depends_on "rust" => :build
@@ -13,10 +13,14 @@ class Diffview < Formula
 
   def caveats
     <<~EOS
-      Configure your preferred terminal before first use:
+      Auto-detect and set your terminal from the current environment:
+      根据当前环境自动检测并设置预览终端：
+        diffview config init
+
+      Or choose it explicitly / 或手动指定:
         diffview config set-terminal iterm2
 
-      Supported terminal values:
+      Supported terminal values / 支持的终端:
         tmux, wezterm, kitty, ghostty, alacritty, iterm2, terminal
     EOS
   end
