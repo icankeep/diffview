@@ -44,6 +44,9 @@ enum ConfigCommand {
     },
     /// Print the configured default terminal backend.
     GetTerminal,
+    /// Detect the terminal from the environment and set it as the default if
+    /// none is configured yet, then print how to change it.
+    Init,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -113,8 +116,95 @@ fn handle_config_command(command: ConfigCommand) -> Result<()> {
             Some(terminal) => println!("{terminal}"),
             None => bail!(missing_terminal_config_message()),
         },
+        ConfigCommand::Init => init_default_terminal()?,
     }
     Ok(())
+}
+
+/// Auto-configure the default terminal during install. Keeps any existing
+/// choice so reinstalls are idempotent; otherwise detects from the current
+/// environment. Prints a bilingual summary in every case.
+fn init_default_terminal() -> Result<()> {
+    if let Some(existing) = read_default_terminal().transpose()? {
+        println!("{}", init_summary(existing.trim(), true));
+        return Ok(());
+    }
+    match detect_backend_from_env() {
+        Some(arg) => {
+            write_default_terminal(arg)?;
+            println!("{}", init_summary(arg.as_config_value(), false));
+        }
+        None => println!("{}", could_not_detect_message()),
+    }
+    Ok(())
+}
+
+/// Best-effort detection of the host terminal from well-known env vars.
+fn detect_backend_from_env() -> Option<BackendArg> {
+    detect_backend(|key| env::var(key).ok())
+}
+
+fn detect_backend(get: impl Fn(&str) -> Option<String>) -> Option<BackendArg> {
+    // Prefer tmux when running inside it: the launcher splits the current window.
+    if get("TMUX").is_some_and(|v| !v.is_empty()) {
+        return Some(BackendArg::Tmux);
+    }
+    if let Some(tp) = get("TERM_PROGRAM") {
+        let tp = tp.to_ascii_lowercase();
+        if tp.contains("iterm") {
+            return Some(BackendArg::Iterm2);
+        }
+        if tp.contains("apple_terminal") {
+            return Some(BackendArg::Terminal);
+        }
+        if tp.contains("wezterm") {
+            return Some(BackendArg::Wezterm);
+        }
+        if tp.contains("ghostty") {
+            return Some(BackendArg::Ghostty);
+        }
+    }
+    if get("KITTY_WINDOW_ID").is_some() {
+        return Some(BackendArg::Kitty);
+    }
+    if get("WEZTERM_PANE").is_some() || get("WEZTERM_EXECUTABLE").is_some() {
+        return Some(BackendArg::Wezterm);
+    }
+    if get("ALACRITTY_WINDOW_ID").is_some() || get("ALACRITTY_SOCKET").is_some() {
+        return Some(BackendArg::Alacritty);
+    }
+    if get("GHOSTTY_RESOURCES_DIR").is_some() || get("GHOSTTY_BIN_DIR").is_some() {
+        return Some(BackendArg::Ghostty);
+    }
+    None
+}
+
+const SUPPORTED_TERMINALS: &str = "tmux, wezterm, kitty, ghostty, alacritty, iterm2, terminal";
+
+fn init_summary(value: &str, already: bool) -> String {
+    let zh_lead = if already {
+        format!("diffview：默认预览终端已设置为 “{value}”。")
+    } else {
+        format!("diffview：已根据当前环境将默认预览终端设置为 “{value}”。")
+    };
+    let en_lead = if already {
+        format!("diffview: default preview terminal is already set to \"{value}\".")
+    } else {
+        format!(
+            "diffview: default preview terminal set to \"{value}\" (detected from your environment)."
+        )
+    };
+    format!(
+        "{zh_lead}\n如需调整，请运行：diffview config set-terminal <terminal>\n支持的终端：{SUPPORTED_TERMINALS}\n\n\
+         {en_lead}\nTo change it, run: diffview config set-terminal <terminal>\nSupported terminals: {SUPPORTED_TERMINALS}"
+    )
+}
+
+fn could_not_detect_message() -> String {
+    format!(
+        "diffview：未能从当前环境识别终端类型。请运行：diffview config set-terminal <terminal> 进行设置。\n支持的终端：{SUPPORTED_TERMINALS}\n\n\
+         diffview: could not detect a terminal from your environment. Run: diffview config set-terminal <terminal>\nSupported terminals: {SUPPORTED_TERMINALS}"
+    )
 }
 
 fn select_backend_from_config(
@@ -407,5 +497,80 @@ mod tests {
             select_backend_from_config(Some(BackendArg::Terminal), Some("iterm2"),).unwrap(),
             Backend::TerminalApp
         );
+    }
+
+    fn detect_with(pairs: &[(&str, &str)]) -> Option<BackendArg> {
+        detect_backend(|key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn detect_prefers_tmux_when_inside_it() {
+        assert_eq!(
+            detect_with(&[
+                ("TMUX", "/tmp/tmux-501/default,1,0"),
+                ("TERM_PROGRAM", "iTerm.app")
+            ]),
+            Some(BackendArg::Tmux)
+        );
+    }
+
+    #[test]
+    fn detect_reads_term_program_variants() {
+        assert_eq!(
+            detect_with(&[("TERM_PROGRAM", "iTerm.app")]),
+            Some(BackendArg::Iterm2)
+        );
+        assert_eq!(
+            detect_with(&[("TERM_PROGRAM", "Apple_Terminal")]),
+            Some(BackendArg::Terminal)
+        );
+        assert_eq!(
+            detect_with(&[("TERM_PROGRAM", "WezTerm")]),
+            Some(BackendArg::Wezterm)
+        );
+        assert_eq!(
+            detect_with(&[("TERM_PROGRAM", "ghostty")]),
+            Some(BackendArg::Ghostty)
+        );
+    }
+
+    #[test]
+    fn detect_falls_back_to_terminal_specific_vars() {
+        assert_eq!(
+            detect_with(&[("KITTY_WINDOW_ID", "1")]),
+            Some(BackendArg::Kitty)
+        );
+        assert_eq!(
+            detect_with(&[("ALACRITTY_WINDOW_ID", "1")]),
+            Some(BackendArg::Alacritty)
+        );
+        assert_eq!(
+            detect_with(&[("GHOSTTY_RESOURCES_DIR", "/x")]),
+            Some(BackendArg::Ghostty)
+        );
+        assert_eq!(
+            detect_with(&[("WEZTERM_PANE", "0")]),
+            Some(BackendArg::Wezterm)
+        );
+    }
+
+    #[test]
+    fn detect_returns_none_for_unknown_environment() {
+        assert_eq!(detect_with(&[("TERM", "xterm-256color")]), None);
+        assert_eq!(detect_with(&[]), None);
+    }
+
+    #[test]
+    fn init_summary_is_bilingual_and_shows_change_command() {
+        let msg = init_summary("iterm2", false);
+        assert!(msg.contains("默认预览终端"));
+        assert!(msg.contains("default preview terminal"));
+        assert!(msg.contains("iterm2"));
+        assert!(msg.contains("diffview config set-terminal"));
     }
 }

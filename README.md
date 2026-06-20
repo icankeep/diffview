@@ -33,7 +33,14 @@ cargo install --git https://github.com/icankeep/diffview
 
 ## First Use
 
-Configure your preferred terminal once:
+The curl installer auto-detects your terminal from the environment and sets it
+as the default. To (re)run detection yourself, or after a Homebrew install:
+
+```bash
+diffview config init
+```
+
+To choose the terminal explicitly:
 
 ```bash
 diffview config set-terminal iterm2

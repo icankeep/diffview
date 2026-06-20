@@ -85,6 +85,10 @@ case ":$PATH:" in
 		;;
 esac
 
-printf '\nDone. Configure your terminal once, then run diffview:\n'
-printf '  diffview config set-terminal iterm2\n'
-printf '  diffview .\n'
+# Auto-detect the terminal from the current environment and set it as the
+# default (keeps any existing choice). Prints a bilingual summary of the
+# chosen terminal and how to change it.
+printf '\n'
+"$BIN_DIR/diffview" config init || true
+
+printf '\nrun / 运行: diffview .\n'

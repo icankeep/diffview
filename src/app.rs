@@ -57,10 +57,19 @@ pub struct App {
     pub diff_height: u16,
     pub tree_height: u16,
     pub tree_width: u16,
+    /// When true the file-tree pane is fully hidden and the diff fills the row.
+    pub tree_collapsed: bool,
+    /// Clickable collapse/expand icon, recorded during the last draw.
+    pub tree_toggle_icon: Rect,
     pub tree_area: Rect,
     pub tree_inner: Rect,
     pub diff_area: Rect,
+    /// Percentage of the diff region given to the old (left) pane.
+    pub diff_split_pct: u16,
+    /// Column of the old/new divider, recorded during the last draw.
+    pub diff_split_x: u16,
     pub resizing_tree: bool,
+    pub resizing_diff: bool,
     pub hl: Highlighter,
     /// Cache key: (file index, is_old_side).
     pub hl_cache: HashMap<(usize, bool), Vec<StyledLine>>,
@@ -105,10 +114,15 @@ impl App {
             diff_height: 24,
             tree_height: 24,
             tree_width: 32,
+            tree_collapsed: false,
+            tree_toggle_icon: Rect::default(),
             tree_area: Rect::default(),
             tree_inner: Rect::default(),
             diff_area: Rect::default(),
+            diff_split_pct: 50,
+            diff_split_x: 0,
             resizing_tree: false,
+            resizing_diff: false,
             hl: Highlighter::new(),
             hl_cache: HashMap::new(),
             full_marks: HashMap::new(),
@@ -163,6 +177,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 Char('c') => self.quit = true,
+                Char('b') => self.toggle_tree_collapsed(),
                 Char('d') => self.page(1),
                 Char('u') => self.page(-1),
                 KeyCode::Left => self.horizontal_scroll(-24),
@@ -184,9 +199,14 @@ impl App {
             }
             Tab | BackTab => {
                 self.count_prefix = None;
-                self.focus = match self.focus {
-                    Focus::Tree => Focus::Diff,
-                    Focus::Diff => Focus::Tree,
+                if self.tree_collapsed {
+                    self.tree_collapsed = false;
+                    self.focus = Focus::Tree;
+                } else {
+                    self.focus = match self.focus {
+                        Focus::Tree => Focus::Diff,
+                        Focus::Diff => Focus::Tree,
+                    }
                 }
             }
             Left if key.modifiers.contains(KeyModifiers::SHIFT) => self.horizontal_scroll(-4),
@@ -197,6 +217,7 @@ impl App {
             Char('L') => self.horizontal_scroll(24),
             Char('h') | Left => {
                 self.count_prefix = None;
+                self.tree_collapsed = false;
                 self.focus = Focus::Tree;
             }
             Char('l') | Right => {
@@ -509,7 +530,10 @@ impl App {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(event.column, event.row),
             MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(event.column),
-            MouseEventKind::Up(MouseButton::Left) => self.resizing_tree = false,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.resizing_tree = false;
+                self.resizing_diff = false;
+            }
             MouseEventKind::ScrollDown => self.mouse_scroll_at(event.column, event.row, 1),
             MouseEventKind::ScrollUp => self.mouse_scroll_at(event.column, event.row, -1),
             MouseEventKind::ScrollRight => self.mouse_horizontal_scroll(1),
@@ -519,8 +543,16 @@ impl App {
     }
 
     fn mouse_down(&mut self, col: u16, row: u16) {
-        if self.is_on_split(col) {
+        if contains(self.tree_toggle_icon, col, row) {
+            self.toggle_tree_collapsed();
+            return;
+        }
+        if self.is_on_split(col, row) {
             self.resizing_tree = true;
+            return;
+        }
+        if self.is_on_diff_split(col, row) {
+            self.resizing_diff = true;
             return;
         }
         if contains(self.tree_area, col, row) {
@@ -536,7 +568,21 @@ impl App {
     fn mouse_drag(&mut self, col: u16) {
         if self.resizing_tree {
             self.tree_width = col.clamp(18, 80);
+        } else if self.resizing_diff {
+            self.set_diff_split(col);
         }
+    }
+
+    fn set_diff_split(&mut self, col: u16) {
+        let area = self.diff_area;
+        if area.width == 0 {
+            return;
+        }
+        let rel = col.saturating_sub(area.x).min(area.width);
+        // Round to match the percent-to-column conversion used when rendering,
+        // so the divider tracks the cursor instead of lagging by a column.
+        let pct = ((rel as u32 * 100 + area.width as u32 / 2) / area.width as u32) as u16;
+        self.diff_split_pct = pct.clamp(10, 90);
     }
 
     fn mouse_scroll_at(&mut self, col: u16, row: u16, delta: isize) {
@@ -548,9 +594,33 @@ impl App {
         self.mouse_scroll(delta);
     }
 
-    fn is_on_split(&self, col: u16) -> bool {
+    fn toggle_tree_collapsed(&mut self) {
+        self.count_prefix = None;
+        // Cancel any in-flight drag so it cannot act on the changed geometry.
+        self.resizing_tree = false;
+        self.resizing_diff = false;
+        self.tree_collapsed = !self.tree_collapsed;
+        self.focus = if self.tree_collapsed {
+            Focus::Diff
+        } else {
+            Focus::Tree
+        };
+    }
+
+    fn is_on_split(&self, col: u16, row: u16) -> bool {
+        if self.tree_collapsed || !within_rows(self.tree_area, row) {
+            return false;
+        }
         let split = self.tree_area.x.saturating_add(self.tree_area.width);
         col.abs_diff(split) <= 1
+    }
+
+    fn is_on_diff_split(&self, col: u16, row: u16) -> bool {
+        // The divider occupies the two adjacent border columns just left of the
+        // new pane; do not grab the new pane's first content column.
+        self.diff_split_x > 0
+            && within_rows(self.diff_area, row)
+            && (col == self.diff_split_x || col + 1 == self.diff_split_x)
     }
 
     fn tree_row_at(&self, row: u16) -> Option<usize> {
@@ -869,6 +939,10 @@ impl App {
     }
 }
 
+fn within_rows(area: Rect, row: u16) -> bool {
+    row >= area.y && row < area.y.saturating_add(area.height)
+}
+
 fn contains(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x
         && row >= area.y
@@ -1105,6 +1179,128 @@ mod tests {
         assert_eq!(app.tree_width, 45);
     }
 
+    #[test]
+    fn mouse_drag_on_diff_split_resizes_diff_panes() {
+        let mut app = test_app();
+        // Diff region spans columns 30..100; divider sits at column 65.
+        app.diff_area = Rect::new(30, 0, 70, 10);
+        app.diff_split_x = 65;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 65,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.resizing_diff);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 44,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        // 44 is 14 columns into a 70-wide region -> 20%.
+        assert_eq!(app.diff_split_pct, 20);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 44,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(!app.resizing_diff);
+    }
+
+    #[test]
+    fn ctrl_b_toggles_tree_collapse() {
+        let mut app = test_app();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert!(app.tree_collapsed);
+        assert_eq!(app.focus, Focus::Diff);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+
+        assert!(!app.tree_collapsed);
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn tab_reveals_collapsed_tree() {
+        let mut app = test_app();
+        app.tree_collapsed = true;
+        app.focus = Focus::Diff;
+
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        assert!(!app.tree_collapsed);
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn clicking_toggle_icon_collapses_and_expands_tree() {
+        let mut app = test_app();
+        app.tree_toggle_icon = Rect::new(26, 0, 3, 1);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 27,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(app.tree_collapsed);
+        assert_eq!(app.focus, Focus::Diff);
+
+        // While collapsed the icon moves to the diff region's corner.
+        app.tree_toggle_icon = Rect::new(0, 0, 3, 1);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(!app.tree_collapsed);
+        assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn click_below_diff_area_does_not_start_resize() {
+        let mut app = test_app();
+        app.diff_area = Rect::new(30, 0, 70, 10);
+        app.diff_split_x = 65;
+
+        // Row 10 is the status bar, outside the diff area's rows.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 65,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(!app.resizing_diff);
+    }
+
+    #[test]
+    fn collapsed_tree_ignores_split_drag() {
+        let mut app = test_app();
+        app.tree_collapsed = true;
+        app.tree_area = Rect::new(0, 0, 0, 10);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(!app.resizing_tree);
+    }
+
     fn press_chars(app: &mut App, chars: &str) {
         for c in chars.chars() {
             let code = match c {
@@ -1167,10 +1363,15 @@ mod tests {
             diff_height: 24,
             tree_height: 24,
             tree_width: 32,
+            tree_collapsed: false,
+            tree_toggle_icon: Rect::default(),
             tree_area: Rect::default(),
             tree_inner: Rect::default(),
             diff_area: Rect::default(),
+            diff_split_pct: 50,
+            diff_split_x: 0,
             resizing_tree: false,
+            resizing_diff: false,
             hl: Highlighter::new(),
             hl_cache: HashMap::new(),
             full_marks: HashMap::new(),

@@ -28,6 +28,8 @@
 - `H` / `L` scroll code horizontally.
 - Mouse click selects tree rows or focuses the diff pane.
 - Dragging the split between the tree and diff panes resizes the tree pane.
+- Dragging the split between the old and new diff panes resizes them (`diff_split_pct`).
+- `Ctrl+b` fully collapses/hides the file tree pane (`tree_collapsed`); `Tab` or `h`/`Left` reveals it again.
 
 ## Launcher
 
@@ -38,6 +40,7 @@ after installing.
 
 Examples:
 
+- Auto-detect from the environment (used by the installer): `diffview config init`
 - Configure iTerm2: `diffview config set-terminal iterm2`
 - Show configured terminal: `diffview config get-terminal`
 - Open using the configured terminal: `diffview .`

@@ -27,19 +27,22 @@ const ACCENT: Color = Color::Rgb(110, 150, 230);
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-    let tree_w = app
-        .tree_width
-        .clamp(18, frame.area().width.saturating_sub(20));
-    let [tree_a, old_a, new_a] = Layout::horizontal([
-        Constraint::Length(tree_w),
-        Constraint::Fill(1),
-        Constraint::Fill(1),
-    ])
-    .areas(main);
+    let (tree_a, diff_region) = if app.tree_collapsed {
+        (Rect::new(main.x, main.y, 0, main.height), main)
+    } else {
+        let max_w = main.width.saturating_sub(20).max(1);
+        let tree_w = app.tree_width.clamp(18.min(max_w), max_w);
+        let [t, d] =
+            Layout::horizontal([Constraint::Length(tree_w), Constraint::Fill(1)]).areas(main);
+        (t, d)
+    };
     app.tree_area = tree_a;
-    app.diff_area = old_a.union(new_a);
+    app.diff_area = diff_region;
 
-    draw_tree(frame, app, tree_a);
+    if !app.tree_collapsed {
+        draw_tree(frame, app, tree_a);
+    }
+    app.diff_split_x = 0;
     match app.view {
         View::Diff => {
             let added = app
@@ -47,17 +50,50 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .and_then(|fi| app.files.get(fi))
                 .is_some_and(|f| f.status == FileStatus::Added);
             if added {
-                draw_added_diff(frame, app, old_a.union(new_a));
+                draw_added_diff(frame, app, diff_region);
             } else {
+                let (old_a, new_a) = split_diff(app, diff_region);
+                app.diff_split_x = new_a.x;
                 draw_diff(frame, app, old_a, new_a);
             }
         }
-        View::Full => draw_full(frame, app, old_a.union(new_a)),
+        View::Full => draw_full(frame, app, diff_region),
     }
+    draw_tree_toggle(frame, app, tree_a, diff_region);
     draw_status(frame, app, status);
     if app.help {
         draw_help(frame, frame.area());
     }
+}
+
+/// Render the clickable collapse/expand icon and record its hit area.
+/// When expanded it sits at the top-right of the tree border (◀ to hide);
+/// when collapsed it sits at the top-left of the diff region (▶ to reveal).
+fn draw_tree_toggle(frame: &mut Frame, app: &mut App, tree_a: Rect, diff_region: Rect) {
+    let (rect, glyph) = if app.tree_collapsed {
+        (Rect::new(diff_region.x, diff_region.y, 3, 1), " ▶ ")
+    } else {
+        let x = tree_a.x + tree_a.width.saturating_sub(4);
+        (Rect::new(x, tree_a.y, 3, 1), " ◀ ")
+    };
+    app.tree_toggle_icon = rect;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            glyph,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))),
+        rect,
+    );
+}
+
+/// Split the diff region into old / new panes using `app.diff_split_pct`.
+fn split_diff(app: &App, area: Rect) -> (Rect, Rect) {
+    let min = 8u16.min(area.width / 2);
+    let old_w = ((area.width as u32 * app.diff_split_pct as u32 + 50) / 100) as u16;
+    let old_w = old_w.clamp(min, area.width.saturating_sub(min).max(1));
+    let [old_a, new_a] =
+        Layout::horizontal([Constraint::Length(old_w), Constraint::Fill(1)]).areas(area);
+    (old_a, new_a)
 }
 
 fn draw_added_diff(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -533,7 +569,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         }
     } else {
         String::from(
-            " q quit · ? help · / search · [] folders · drag split · H/L sideways · v view · r refresh",
+            " q quit · ? help · / search · [] folders · ^b tree · drag splits · H/L sideways · v view · r refresh",
         )
     };
     frame.render_widget(
@@ -570,7 +606,7 @@ fn digits(n: usize) -> usize {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.saturating_sub(8).clamp(58, 92);
-    let h = 23.min(area.height.saturating_sub(4));
+    let h = 33.min(area.height.saturating_sub(4));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -592,6 +628,7 @@ fn help_lines(width: usize, max_lines: usize) -> Vec<Line<'static>> {
             "Navigation",
             &[
                 ("Tab", "switch focus between file tree and diff"),
+                ("Ctrl+b", "hide or show the file tree pane"),
                 ("j/k, arrows", "move one line; numeric prefix jumps N lines"),
                 ("PgUp/PgDn", "page current pane"),
                 ("Ctrl+u/d", "page current pane up/down"),
@@ -620,8 +657,10 @@ fn help_lines(width: usize, max_lines: usize) -> Vec<Line<'static>> {
             "Mouse",
             &[
                 ("click tree", "select file or toggle folder"),
+                ("click ◀ / ▶", "hide or show the file tree pane"),
                 ("click diff", "focus diff pane"),
-                ("drag split", "resize the file tree"),
+                ("drag tree split", "resize the file tree"),
+                ("drag diff split", "resize the old/new diff panes"),
                 ("wheel", "scroll the pane under the pointer"),
             ],
         ),
