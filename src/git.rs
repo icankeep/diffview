@@ -124,6 +124,7 @@ fn load_directory_entry(root: &Path, path: &Path) -> FileEntry {
         new_lines: Vec::new(),
         rows: Vec::new(),
         anchors: Vec::new(),
+        change_anchors: Vec::new(),
         additions: 0,
         deletions: 0,
     };
@@ -155,6 +156,7 @@ fn load_entry(root: &Path, base: &str, pf: ParsedFile) -> FileEntry {
         new_lines: Vec::new(),
         rows: Vec::new(),
         anchors: Vec::new(),
+        change_anchors: Vec::new(),
         additions: 0,
         deletions: 0,
     };

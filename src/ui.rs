@@ -11,10 +11,17 @@ use crate::highlight::StyledLine;
 use crate::model::{Cell, FileStatus, LineKind, Row};
 
 const DEL_BG: Color = Color::Rgb(58, 22, 22);
-const DEL_EMPH_BG: Color = Color::Rgb(112, 36, 36);
+const DEL_EMPH_BG: Color = Color::Rgb(130, 46, 56);
 const ADD_BG: Color = Color::Rgb(18, 52, 26);
-const ADD_EMPH_BG: Color = Color::Rgb(28, 94, 44);
+const ADD_EMPH_BG: Color = Color::Rgb(34, 110, 56);
 const FILLER_BG: Color = Color::Rgb(24, 24, 28);
+// Brighter, accent-tinted backgrounds for the change block the user jumped to.
+const ACTIVE_ADD_BG: Color = Color::Rgb(34, 112, 66);
+const ACTIVE_ADD_EMPH_BG: Color = Color::Rgb(47, 148, 82);
+const ACTIVE_DEL_BG: Color = Color::Rgb(134, 52, 70);
+const ACTIVE_DEL_EMPH_BG: Color = Color::Rgb(166, 63, 84);
+const ACTIVE_CTX_BG: Color = Color::Rgb(46, 52, 78);
+const ACTIVE_FILLER_BG: Color = Color::Rgb(42, 48, 70);
 const SEARCH_BG: Color = Color::Rgb(115, 90, 25);
 const LINENO_FG: Color = Color::Rgb(108, 112, 122);
 const HEADER_FG: Color = Color::Rgb(100, 160, 190);
@@ -109,6 +116,7 @@ fn draw_added_diff(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     app.ensure_hl(fi);
+    let active = app.active_block_range();
     let f = &app.files[fi];
     let block = Block::bordered()
         .border_style(border)
@@ -127,12 +135,14 @@ fn draw_added_diff(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let h = inner.height as usize;
     app.scroll = app.scroll.min(f.rows.len().saturating_sub(h.max(1)));
+    let scroll = app.scroll;
     let styled = app.hl_cache.get(&(fi, false));
     let nw = digits(f.new_lines.len());
     let width = inner.width as usize;
 
     let mut out: Vec<Line> = Vec::with_capacity(h);
-    for row in f.rows.iter().skip(app.scroll).take(h) {
+    for (off, row) in f.rows.iter().skip(scroll).take(h).enumerate() {
+        let mark = active.is_some_and(|(s, e)| scroll + off >= s && scroll + off < e);
         match row {
             Row::HunkHeader(i) => {
                 let hk = &f.hunks[*i];
@@ -142,7 +152,15 @@ fn draw_added_diff(frame: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             Row::Line { new, .. } => {
-                let line = render_cell(new, &f.new_lines, styled, nw, width, app.hscroll);
+                let line = render_cell(
+                    new,
+                    &f.new_lines,
+                    styled,
+                    nw,
+                    width,
+                    app.hscroll[app.diff_side],
+                    mark,
+                );
                 out.push(apply_search_highlight(line, app));
             }
         }
@@ -251,6 +269,7 @@ fn draw_diff(frame: &mut Frame, app: &mut App, old_a: Rect, new_a: Rect) {
         return;
     };
     app.ensure_hl(fi);
+    let active = app.active_block_range();
     let f = &app.files[fi];
 
     let old_title = match &app.source {
@@ -290,7 +309,8 @@ fn draw_diff(frame: &mut Frame, app: &mut App, old_a: Rect, new_a: Rect) {
 
     let mut ol: Vec<Line> = Vec::with_capacity(h);
     let mut nl: Vec<Line> = Vec::with_capacity(h);
-    for row in f.rows.iter().skip(scroll).take(h) {
+    for (off, row) in f.rows.iter().skip(scroll).take(h).enumerate() {
+        let mark = active.is_some_and(|(s, e)| scroll + off >= s && scroll + off < e);
         match row {
             Row::HunkHeader(i) => {
                 let hk = &f.hunks[*i];
@@ -303,10 +323,24 @@ fn draw_diff(frame: &mut Frame, app: &mut App, old_a: Rect, new_a: Rect) {
                 nl.push(Line::styled(text, style));
             }
             Row::Line { old, new } => {
-                let old_line =
-                    render_cell(old, &f.old_lines, old_styled, old_nw, old_w, app.hscroll);
-                let new_line =
-                    render_cell(new, &f.new_lines, new_styled, new_nw, new_w, app.hscroll);
+                let old_line = render_cell(
+                    old,
+                    &f.old_lines,
+                    old_styled,
+                    old_nw,
+                    old_w,
+                    app.hscroll[0],
+                    mark,
+                );
+                let new_line = render_cell(
+                    new,
+                    &f.new_lines,
+                    new_styled,
+                    new_nw,
+                    new_w,
+                    app.hscroll[1],
+                    mark,
+                );
                 ol.push(apply_search_highlight(old_line, app));
                 nl.push(apply_search_highlight(new_line, app));
             }
@@ -323,20 +357,23 @@ fn render_cell(
     num_w: usize,
     width: usize,
     hscroll: usize,
+    marker: bool,
 ) -> Line<'static> {
     if cell.kind == LineKind::Filler {
-        return Line::styled(" ".repeat(width), Style::new().bg(FILLER_BG));
+        let bg = if marker { ACTIVE_FILLER_BG } else { FILLER_BG };
+        return filler_line(num_w, width, marker, bg);
     }
-    let (row_bg, emph_bg) = match cell.kind {
-        LineKind::Del => (Some(DEL_BG), Some(DEL_EMPH_BG)),
-        LineKind::Add => (Some(ADD_BG), Some(ADD_EMPH_BG)),
-        _ => (None, None),
+    let (row_bg, emph_bg) = match (cell.kind, marker) {
+        (LineKind::Del, false) => (Some(DEL_BG), Some(DEL_EMPH_BG)),
+        (LineKind::Add, false) => (Some(ADD_BG), Some(ADD_EMPH_BG)),
+        (LineKind::Del, true) => (Some(ACTIVE_DEL_BG), Some(ACTIVE_DEL_EMPH_BG)),
+        (LineKind::Add, true) => (Some(ACTIVE_ADD_BG), Some(ACTIVE_ADD_EMPH_BG)),
+        // Context rows only reach here inside an active block (a same-line edit).
+        (_, true) => (Some(ACTIVE_CTX_BG), None),
+        (_, false) => (None, None),
     };
     let ln = cell.line_no.unwrap_or(0);
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(
-        format!("{ln:>num_w$} "),
-        Style::new().fg(LINENO_FG),
-    )];
+    let mut spans: Vec<Span<'static>> = vec![gutter(ln, num_w, marker)];
     let content: StyledLine = styled
         .and_then(|s| s.get(ln.saturating_sub(1)))
         .cloned()
@@ -363,6 +400,36 @@ fn render_cell(
         line = line.style(Style::new().bg(bg));
     }
     line
+}
+
+/// A filler row (no counterpart on this side). When `marker` is set it still
+/// carries the accent bar at the gutter boundary so the active block's left
+/// edge stays continuous across both panes.
+fn filler_line(num_w: usize, width: usize, marker: bool, bg: Color) -> Line<'static> {
+    if !marker {
+        return Line::styled(" ".repeat(width), Style::new().bg(bg));
+    }
+    let mut spans = vec![
+        Span::raw(" ".repeat(num_w)),
+        Span::styled("▎", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+    ];
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(num_w + 1))));
+    Line::from(spans).style(Style::new().bg(bg))
+}
+
+/// Line-number gutter span. When `marker` is set, the trailing separator
+/// becomes an accent bar and the number is recolored, flagging a row inside the
+/// change block the user just jumped to. Width stays `num_w + 1` either way so
+/// horizontal scrolling and code alignment are unaffected.
+fn gutter(ln: usize, num_w: usize, marker: bool) -> Span<'static> {
+    if marker {
+        Span::styled(
+            format!("{ln:>num_w$}▎"),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(format!("{ln:>num_w$} "), Style::new().fg(LINENO_FG))
+    }
 }
 
 fn scroll_code_spans(
@@ -450,6 +517,7 @@ fn draw_full(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     app.ensure_full(fi);
+    let active = app.active_block_range();
     let f = &app.files[fi];
     let side = if f.status == FileStatus::Deleted {
         " (deleted, showing base)"
@@ -484,24 +552,30 @@ fn draw_full(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut out: Vec<Line> = Vec::with_capacity(h);
     for (idx, raw) in lines_src.iter().enumerate().skip(scroll).take(h) {
         let ln = idx + 1;
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(
-            format!("{ln:>nw$} "),
-            Style::new().fg(LINENO_FG),
-        )];
+        let mark = active.is_some_and(|(s, e)| idx >= s && idx < e);
+        let mut spans: Vec<Span<'static>> = vec![gutter(ln, nw, mark)];
         match styled.and_then(|s| s.get(idx)) {
             Some(frags) => spans.extend(frags.iter().map(|(st, tx)| Span::styled(tx.clone(), *st))),
             None => spans.push(Span::raw(raw.clone())),
         }
-        if app.hscroll > 0 {
-            spans = scroll_code_spans(spans, nw + 1, app.hscroll);
+        let hscroll = app.hscroll[app.diff_side];
+        if hscroll > 0 {
+            spans = scroll_code_spans(spans, nw + 1, hscroll);
         }
         let mut line = Line::from(spans);
-        if marks.is_some_and(|m| m.contains(&ln)) {
+        let row_bg = if mark {
+            Some(ACTIVE_ADD_BG)
+        } else if marks.is_some_and(|m| m.contains(&ln)) {
+            Some(ADD_BG)
+        } else {
+            None
+        };
+        if let Some(bg) = row_bg {
             let pad = width.saturating_sub(line.width());
             if pad > 0 {
                 line.push_span(Span::raw(" ".repeat(pad)));
             }
-            line = line.style(Style::new().bg(ADD_BG));
+            line = line.style(Style::new().bg(bg));
         }
         out.push(apply_search_highlight(line, app));
     }
@@ -569,7 +643,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         }
     } else {
         String::from(
-            " q quit · ? help · / search · [] folders · ^b tree · drag splits · H/L sideways · v view · r refresh",
+            " q quit · ? help · / search · n/p changes · [] folders · ^b tree · drag splits · H/L sideways · v view · r refresh",
         )
     };
     frame.render_widget(
@@ -579,12 +653,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let right = match app.selected {
         Some(fi) => {
             let f = &app.files[fi];
-            let hunk = match (app.current_hunk(), f.hunks.len()) {
-                (Some(k), total) if total > 0 => format!(" · hunk {}/{total}", k + 1),
+            let change = match (app.current_change(), app.change_count()) {
+                (Some(k), total) if total > 0 => format!(" · change {}/{total}", k + 1),
                 _ => String::new(),
             };
             format!(
-                "{} +{} -{}{hunk} ",
+                "{} +{} -{}{change} ",
                 f.path.display(),
                 f.additions,
                 f.deletions
@@ -606,7 +680,7 @@ fn digits(n: usize) -> usize {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.saturating_sub(8).clamp(58, 92);
-    let h = 33.min(area.height.saturating_sub(4));
+    let h = 35.min(area.height.saturating_sub(4));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -630,6 +704,7 @@ fn help_lines(width: usize, max_lines: usize) -> Vec<Line<'static>> {
                 ("Tab", "switch focus between file tree and diff"),
                 ("Ctrl+b", "hide or show the file tree pane"),
                 ("j/k, arrows", "move one line; numeric prefix jumps N lines"),
+                ("n / p", "jump to next / previous change"),
                 ("PgUp/PgDn", "page current pane"),
                 ("Ctrl+u/d", "page current pane up/down"),
                 ("g / G", "jump to top or bottom"),
@@ -649,7 +724,7 @@ fn help_lines(width: usize, max_lines: usize) -> Vec<Line<'static>> {
             "View",
             &[
                 ("v", "toggle diff and full-file view"),
-                ("H / L", "scroll code horizontally"),
+                ("H / L", "scroll active pane horizontally"),
                 ("Shift/Ctrl arrows", "fine or large horizontal code scroll"),
             ],
         ),
@@ -658,7 +733,7 @@ fn help_lines(width: usize, max_lines: usize) -> Vec<Line<'static>> {
             &[
                 ("click tree", "select file or toggle folder"),
                 ("click ◀ / ▶", "hide or show the file tree pane"),
-                ("click diff", "focus diff pane"),
+                ("click diff", "focus diff pane / pick active side"),
                 ("drag tree split", "resize the file tree"),
                 ("drag diff split", "resize the old/new diff panes"),
                 ("wheel", "scroll the pane under the pointer"),
@@ -725,4 +800,78 @@ fn one_line_prefix(text: &str, width: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn color_distance(a: Color, b: Color) -> u16 {
+        match (a, b) {
+            (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+                u16::from(ar.abs_diff(br)) + u16::from(ag.abs_diff(bg)) + u16::from(ab.abs_diff(bb))
+            }
+            _ => 0,
+        }
+    }
+
+    fn color_brightness(color: Color) -> u16 {
+        match color {
+            Color::Rgb(r, g, b) => u16::from(r) + u16::from(g) + u16::from(b),
+            _ => 0,
+        }
+    }
+
+    fn rendered_backgrounds(kind: LineKind, marker: bool) -> (Color, Color) {
+        let cell = Cell {
+            line_no: Some(1),
+            kind,
+            inline: vec![(0, 3)],
+        };
+        let src = vec!["changed".to_string()];
+        let line = render_cell(&cell, &src, None, 1, 20, 0, marker);
+        let row = line.style.bg.expect("changed row background");
+        let inline = line
+            .spans
+            .iter()
+            .skip(1)
+            .find_map(|span| span.style.bg)
+            .expect("inline change background");
+        (row, inline)
+    }
+
+    #[test]
+    fn active_change_row_renders_marker_bar_and_background() {
+        let cell = Cell {
+            line_no: Some(1),
+            kind: LineKind::Add,
+            inline: Vec::new(),
+        };
+        let src = vec!["changed".to_string()];
+
+        let line = render_cell(&cell, &src, None, 1, 20, 0, true);
+
+        assert_eq!(line.spans[0].content.as_ref(), "1▎");
+        assert_eq!(line.spans[0].style.fg, Some(ACCENT));
+        assert_eq!(line.style.bg, Some(ACTIVE_ADD_BG));
+    }
+
+    #[test]
+    fn inline_change_backgrounds_are_clearly_distinct_from_their_rows() {
+        for kind in [LineKind::Add, LineKind::Del] {
+            let (row, inline) = rendered_backgrounds(kind, false);
+            assert!(color_distance(row, inline) >= 100);
+
+            let (active_row, active_inline) = rendered_backgrounds(kind, true);
+            assert!(color_distance(active_row, active_inline) >= 55);
+        }
+    }
+
+    #[test]
+    fn active_inline_change_backgrounds_stay_below_the_brightness_ceiling() {
+        for kind in [LineKind::Add, LineKind::Del] {
+            let (_, active_inline) = rendered_backgrounds(kind, true);
+            assert!(color_brightness(active_inline) <= 315);
+        }
+    }
 }

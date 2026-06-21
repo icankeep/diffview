@@ -97,6 +97,24 @@ fn collapse(nodes: &mut Vec<Node>) {
 }
 
 impl Tree {
+    /// File indices in the tree's depth-first display order. This ignores
+    /// expansion state so navigation still covers files in collapsed folders.
+    pub fn file_order(&self) -> Vec<usize> {
+        fn walk(nodes: &[Node], files: &mut Vec<usize>) {
+            for node in nodes {
+                if let Some(file) = node.file {
+                    files.push(file);
+                } else {
+                    walk(&node.children, files);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(&self.roots, &mut files);
+        files
+    }
+
     pub fn flatten(&self) -> Vec<TreeRow> {
         fn walk(nodes: &[Node], depth: usize, path: &mut Vec<usize>, rows: &mut Vec<TreeRow>) {
             for (i, n) in nodes.iter().enumerate() {
@@ -150,6 +168,7 @@ mod tests {
             new_lines: Vec::new(),
             rows: Vec::new(),
             anchors: Vec::new(),
+            change_anchors: Vec::new(),
             additions: 0,
             deletions: 0,
         }

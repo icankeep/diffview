@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::git;
 use crate::highlight::{Highlighter, StyledLine};
-use crate::model::FileEntry;
+use crate::model::{FileEntry, LineKind, Row};
 use crate::tree::{self, Tree, TreeRow};
 
 #[derive(Debug, Clone)]
@@ -51,8 +51,15 @@ pub struct App {
     pub view: View,
     /// Vertical offset into the diff rows / full-file lines.
     pub scroll: usize,
-    /// Horizontal character offset into rendered code text.
-    pub hscroll: usize,
+    /// Row/line index of the change block we last jumped to (n/p), in the
+    /// current view's coordinate space. Drives the on-screen marker; retained
+    /// through manual scrolling and cleared by file switches or non-change jumps.
+    pub active_change: Option<usize>,
+    /// Horizontal character offset per pane: [0] = old/left, [1] = new/right.
+    /// Single-pane views (added file, full view) use the new-side slot.
+    pub hscroll: [usize; 2],
+    /// Diff side targeted by keyboard horizontal scroll: 0 = old, 1 = new.
+    pub diff_side: usize,
     /// Inner heights recorded during the last draw, for paging and clamping.
     pub diff_height: u16,
     pub tree_height: u16,
@@ -110,7 +117,9 @@ impl App {
             focus: Focus::Tree,
             view: View::Diff,
             scroll: 0,
-            hscroll: 0,
+            active_change: None,
+            hscroll: [0, 0],
+            diff_side: 1,
             diff_height: 24,
             tree_height: 24,
             tree_width: 32,
@@ -157,7 +166,8 @@ impl App {
             None => 0,
         };
         self.scroll = 0;
-        self.hscroll = 0;
+        self.active_change = None;
+        self.hscroll = [0, 0];
         self.tree_scroll = 0;
     }
 
@@ -243,11 +253,11 @@ impl App {
             }
             Char('n') if !self.search_query.is_empty() => self.jump_search(1),
             Char('N') if !self.search_query.is_empty() => self.jump_search(-1),
-            Char('n') => self.jump_hunk_count(1),
-            Char('p') | Char('N') => self.jump_hunk_count(-1),
+            Char('n') => self.jump_change_count(1),
+            Char('p') | Char('N') => self.jump_change_count(-1),
             Char('v') => {
                 self.count_prefix = None;
-                self.hscroll = 0;
+                self.hscroll = [0, 0];
                 self.toggle_view();
             }
             Char('r') => {
@@ -322,9 +332,9 @@ impl App {
         self.page(dir * count);
     }
 
-    fn jump_hunk_count(&mut self, dir: isize) {
+    fn jump_change_count(&mut self, dir: isize) {
         let count = self.take_count() as isize;
-        self.jump_hunk(dir * count);
+        self.jump_change(dir * count);
     }
 
     fn step(&mut self, delta: isize) {
@@ -390,7 +400,8 @@ impl App {
             if self.selected != Some(fi) {
                 self.selected = Some(fi);
                 self.scroll = 0;
-                self.hscroll = 0;
+                self.active_change = None;
+                self.hscroll = [0, 0];
             }
         }
     }
@@ -408,6 +419,8 @@ impl App {
     }
 
     fn scroll_by(&mut self, delta: isize) {
+        // The jump marker persists through manual scrolling: it stays the
+        // "current change" so n/p remain reliable and the highlight is stable.
         let max = self.content_len().saturating_sub(1) as isize;
         self.scroll = (self.scroll as isize + delta).clamp(0, max.max(0)) as usize;
     }
@@ -422,29 +435,76 @@ impl App {
 
     fn anchors_for(&self, fi: usize) -> Vec<usize> {
         match self.view {
-            View::Diff => self.files[fi].anchors.clone(),
-            View::Full => self.files[fi].full_anchors(),
+            View::Diff => self.files[fi].change_anchors.clone(),
+            View::Full => self.files[fi].full_change_anchors(),
         }
     }
 
-    /// Index of the hunk currently at or above the top of the viewport.
-    pub fn current_hunk(&self) -> Option<usize> {
+    /// Index of the active change block: the one we last jumped to if it still
+    /// stands, otherwise the block at or above the top of the viewport.
+    pub fn current_change(&self) -> Option<usize> {
         let fi = self.selected?;
         let anchors = self.anchors_for(fi);
         if anchors.is_empty() {
             return None;
         }
+        if let Some(r) = self.active_change {
+            if let Some(i) = anchors.iter().position(|&a| a == r) {
+                return Some(i);
+            }
+        }
         let n = anchors.partition_point(|&a| a <= self.scroll);
         Some(n.saturating_sub(1))
     }
 
-    fn jump_hunk(&mut self, dir: isize) {
+    /// Row/line range `[start, end)` of the active change block in the current
+    /// view, for rendering the jump marker. `None` when nothing is targeted.
+    pub fn active_block_range(&self) -> Option<(usize, usize)> {
+        let fi = self.selected?;
+        let start = self.active_change?;
+        let f = self.files.get(fi)?;
+        match self.view {
+            View::Diff => {
+                let rows = &f.rows;
+                let mut end = start;
+                while end < rows.len() && is_change_row(&rows[end]) {
+                    end += 1;
+                }
+                Some((start, end.max(start + 1)))
+            }
+            View::Full => {
+                let total = f.full_lines().len();
+                let owned;
+                let changed = match self.full_marks.get(&fi) {
+                    Some(m) => m,
+                    None => {
+                        owned = f.changed_full_lines();
+                        &owned
+                    }
+                };
+                let mut end = start;
+                while end < total && changed.contains(&(end + 1)) {
+                    end += 1;
+                }
+                Some((start, end.max(start + 1)))
+            }
+        }
+    }
+
+    /// Number of change blocks in the selected file for the current view.
+    pub fn change_count(&self) -> usize {
+        self.selected
+            .map(|fi| self.anchors_for(fi).len())
+            .unwrap_or(0)
+    }
+
+    fn jump_change(&mut self, dir: isize) {
         self.focus = Focus::Diff;
         for _ in 0..dir.unsigned_abs().max(1) {
             let moved = if dir > 0 {
-                self.jump_hunk_once(1)
+                self.jump_change_once(1)
             } else {
-                self.jump_hunk_once(-1)
+                self.jump_change_once(-1)
             };
             if !moved {
                 return;
@@ -452,33 +512,84 @@ impl App {
         }
     }
 
-    fn jump_hunk_once(&mut self, dir: isize) -> bool {
+    /// Largest scroll offset the draw pass will not clamp away, given the last
+    /// recorded pane height. Used to keep a centered block from overscrolling.
+    fn max_scroll_for(&self, fi: usize) -> usize {
+        let len = match self.view {
+            View::Diff => self.files[fi].rows.len(),
+            View::Full => self.files[fi].full_lines().len(),
+        };
+        len.saturating_sub(self.diff_height.max(1) as usize)
+    }
+
+    /// Scroll offset that vertically centers `row` in the viewport, clamped so
+    /// the draw pass renders it where we expect.
+    fn center_scroll(&self, fi: usize, row: usize) -> usize {
+        let h = self.diff_height.max(1) as usize;
+        row.saturating_sub(h / 2).min(self.max_scroll_for(fi))
+    }
+
+    /// Mark `row` as the active change block and center the viewport on it.
+    fn focus_change(&mut self, fi: usize, row: usize) {
+        self.active_change = Some(row);
+        self.scroll = self.center_scroll(fi, row);
+    }
+
+    fn jump_change_once(&mut self, dir: isize) -> bool {
         let Some(fi) = self.selected else {
             return false;
         };
-        let cur = self.scroll;
         let anchors = self.anchors_for(fi);
+        // Where we are now: the marked block if it still holds, otherwise infer
+        // from the current scroll position so n/p resume from the viewport.
+        let cur_idx = self
+            .active_change
+            .and_then(|r| anchors.iter().position(|&a| a == r));
         if dir > 0 {
-            if let Some(&a) = anchors.iter().find(|&&a| a > cur) {
-                self.scroll = a;
+            let next = match cur_idx {
+                Some(i) => anchors.get(i + 1).copied(),
+                None => anchors.iter().copied().find(|&a| a >= self.scroll),
+            };
+            if let Some(a) = next {
+                self.focus_change(fi, a);
                 return true;
             }
-            for nfi in fi + 1..self.files.len() {
+            let file_order = self.tree.file_order();
+            let Some(order_idx) = file_order.iter().position(|&candidate| candidate == fi) else {
+                return false;
+            };
+            for &nfi in file_order
+                .iter()
+                .skip(order_idx + 1)
+                .chain(file_order.iter().take(order_idx))
+            {
                 if let Some(&a0) = self.anchors_for(nfi).first() {
                     self.select_file(nfi);
-                    self.scroll = a0;
+                    self.focus_change(nfi, a0);
                     return true;
                 }
             }
         } else {
-            if let Some(&a) = anchors.iter().rev().find(|&&a| a < cur) {
-                self.scroll = a;
+            let prev = match cur_idx {
+                Some(i) => i.checked_sub(1).and_then(|j| anchors.get(j).copied()),
+                None => anchors.iter().rev().copied().find(|&a| a < self.scroll),
+            };
+            if let Some(a) = prev {
+                self.focus_change(fi, a);
                 return true;
             }
-            for nfi in (0..fi).rev() {
+            let file_order = self.tree.file_order();
+            let Some(order_idx) = file_order.iter().position(|&candidate| candidate == fi) else {
+                return false;
+            };
+            for &nfi in file_order[..order_idx]
+                .iter()
+                .rev()
+                .chain(file_order[order_idx + 1..].iter().rev())
+            {
                 if let Some(&al) = self.anchors_for(nfi).last() {
                     self.select_file(nfi);
-                    self.scroll = al;
+                    self.focus_change(nfi, al);
                     return true;
                 }
             }
@@ -494,20 +605,32 @@ impl App {
         }
     }
 
-    pub fn mouse_horizontal_scroll(&mut self, delta: isize) {
+    pub fn mouse_horizontal_scroll(&mut self, col: u16, delta: isize) {
+        // Scroll the pane under the cursor, independently of the other pane.
+        if let Some(side) = self.side_at_col(col) {
+            self.diff_side = side;
+        }
         self.horizontal_scroll(delta * 6);
+    }
+
+    /// Which diff pane a column falls in: 0 = old/left, 1 = new/right.
+    /// `None` when only one pane is visible (no old/new divider).
+    fn side_at_col(&self, col: u16) -> Option<usize> {
+        (self.diff_split_x > 0).then(|| usize::from(col >= self.diff_split_x))
     }
 
     fn horizontal_scroll(&mut self, delta: isize) {
         self.count_prefix = None;
         self.focus = Focus::Diff;
-        self.hscroll = (self.hscroll as isize + delta).max(0) as usize;
+        let cur = self.hscroll[self.diff_side] as isize;
+        self.hscroll[self.diff_side] = (cur + delta).max(0) as usize;
     }
 
     fn select_file(&mut self, fi: usize) {
         self.selected = Some(fi);
         self.scroll = 0;
-        self.hscroll = 0;
+        self.active_change = None;
+        self.hscroll = [0, 0];
         if let Some(rc) = self.tree_rows.iter().position(|r| r.file == Some(fi)) {
             self.cursor = rc;
         }
@@ -536,8 +659,8 @@ impl App {
             }
             MouseEventKind::ScrollDown => self.mouse_scroll_at(event.column, event.row, 1),
             MouseEventKind::ScrollUp => self.mouse_scroll_at(event.column, event.row, -1),
-            MouseEventKind::ScrollRight => self.mouse_horizontal_scroll(1),
-            MouseEventKind::ScrollLeft => self.mouse_horizontal_scroll(-1),
+            MouseEventKind::ScrollRight => self.mouse_horizontal_scroll(event.column, 1),
+            MouseEventKind::ScrollLeft => self.mouse_horizontal_scroll(event.column, -1),
             _ => {}
         }
     }
@@ -562,6 +685,9 @@ impl App {
             }
         } else if contains(self.diff_area, col, row) {
             self.focus = Focus::Diff;
+            if let Some(side) = self.side_at_col(col) {
+                self.diff_side = side;
+            }
         }
     }
 
@@ -632,19 +758,30 @@ impl App {
         (idx < self.tree_rows.len()).then_some(idx)
     }
 
-    /// Switch diff/full view, keeping the viewport on the same hunk.
+    /// Switch diff/full view, keeping the viewport on the same change block.
+    /// A jump marker carries over (re-centered); a plain viewport does not gain
+    /// one, so toggling after a manual scroll doesn't resurrect a marker.
     fn toggle_view(&mut self) {
-        let cur_hunk = self.current_hunk();
+        let had_marker = self.active_change.is_some();
+        let cur_change = self.current_change();
         self.view = match self.view {
             View::Diff => View::Full,
             View::Full => View::Diff,
         };
-        match (self.selected, cur_hunk) {
-            (Some(fi), Some(k)) => {
-                let anchors = self.anchors_for(fi);
-                self.scroll = anchors.get(k).copied().unwrap_or(0);
+        let target = self
+            .selected
+            .zip(cur_change)
+            .and_then(|(fi, k)| self.anchors_for(fi).get(k).copied().map(|a| (fi, a)));
+        match target {
+            Some((fi, a)) if had_marker => self.focus_change(fi, a),
+            Some((fi, a)) => {
+                self.active_change = None;
+                self.scroll = a.min(self.max_scroll_for(fi));
             }
-            _ => self.scroll = 0,
+            None => {
+                self.active_change = None;
+                self.scroll = 0;
+            }
         }
     }
 
@@ -707,6 +844,7 @@ impl App {
             SearchScope::Diff => {
                 if let Some(pos) = self.find_diff_search_match(self.scroll, 1, true) {
                     self.focus = Focus::Diff;
+                    self.active_change = None;
                     self.scroll = pos;
                 }
             }
@@ -730,6 +868,7 @@ impl App {
                         return;
                     };
                     self.focus = Focus::Diff;
+                    self.active_change = None;
                     self.scroll = pos;
                 }
             }
@@ -939,6 +1078,16 @@ impl App {
     }
 }
 
+/// Whether a diff row carries a change (an add/del on either side), as opposed
+/// to a pure context row or a hunk header.
+fn is_change_row(row: &Row) -> bool {
+    matches!(
+        row,
+        Row::Line { old, new }
+            if !(old.kind == LineKind::Context && new.kind == LineKind::Context)
+    )
+}
+
 fn within_rows(area: Rect, row: u16) -> bool {
     row >= area.y && row < area.y.saturating_add(area.height)
 }
@@ -999,29 +1148,234 @@ mod tests {
     #[test]
     fn horizontal_keys_scroll_sideways() {
         let mut app = test_app();
+        app.diff_side = 1;
 
         press_chars(&mut app, "L");
 
         assert_eq!(app.focus, Focus::Diff);
-        assert_eq!(app.hscroll, 24);
+        assert_eq!(app.hscroll[1], 24);
 
         press_chars(&mut app, "H");
 
-        assert_eq!(app.hscroll, 0);
+        assert_eq!(app.hscroll[1], 0);
     }
 
     #[test]
     fn mouse_horizontal_scroll_moves_sideways() {
         let mut app = test_app();
+        app.diff_side = 1;
 
-        app.mouse_horizontal_scroll(2);
+        app.mouse_horizontal_scroll(0, 2);
 
         assert_eq!(app.focus, Focus::Diff);
-        assert_eq!(app.hscroll, 12);
+        assert_eq!(app.hscroll[1], 12);
 
-        app.mouse_horizontal_scroll(-4);
+        app.mouse_horizontal_scroll(0, -4);
 
-        assert_eq!(app.hscroll, 0);
+        assert_eq!(app.hscroll[1], 0);
+    }
+
+    #[test]
+    fn diff_panes_scroll_horizontally_independently() {
+        let mut app = test_app();
+        // Two panes visible, divider at column 40.
+        app.diff_split_x = 40;
+
+        // Scroll over the old (left) pane.
+        app.mouse_horizontal_scroll(10, 3);
+        assert_eq!(app.diff_side, 0);
+        assert_eq!(app.hscroll[0], 18);
+        assert_eq!(app.hscroll[1], 0);
+
+        // Scroll over the new (right) pane: left pane stays put.
+        app.mouse_horizontal_scroll(60, 1);
+        assert_eq!(app.diff_side, 1);
+        assert_eq!(app.hscroll[0], 18);
+        assert_eq!(app.hscroll[1], 6);
+    }
+
+    #[test]
+    fn n_stops_at_each_change_block_within_a_hunk() {
+        let mut app = blocks_app();
+        app.focus = Focus::Diff;
+
+        // rows: [header, +, ctx, ctx, +, ctx, ctx] -> blocks at rows 1 and 4.
+        assert_eq!(app.files[0].change_anchors, vec![1, 4]);
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.active_change, Some(1));
+        assert_eq!(app.current_change(), Some(0));
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.active_change, Some(4));
+        assert_eq!(app.current_change(), Some(1));
+
+        // No further block in this single-file fixture.
+        press_chars(&mut app, "n");
+        assert_eq!(app.active_change, Some(4));
+
+        press_chars(&mut app, "p");
+        assert_eq!(app.active_change, Some(1));
+
+        press_chars(&mut app, "N");
+        assert_eq!(app.active_change, Some(1));
+    }
+
+    #[test]
+    fn jumping_centers_the_target_block_in_the_viewport() {
+        let mut app = blocks_app();
+        app.focus = Focus::Diff;
+
+        // Viewport height 2, so a half-height of 1 is subtracted to center.
+        // Block at row 4 -> scroll 3 (within max scroll 5).
+        press_chars(&mut app, "nn");
+        assert_eq!(app.active_change, Some(4));
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn the_active_marker_spans_the_whole_change_block() {
+        let mut app = blocks_app();
+        app.focus = Focus::Diff;
+
+        // First block is a single added row at index 1.
+        press_chars(&mut app, "n");
+        assert_eq!(app.active_block_range(), Some((1, 2)));
+
+        // The marker persists through manual scrolling so the highlight is
+        // stable and n/p stay anchored to the current change.
+        press_chars(&mut app, "j");
+        assert_eq!(app.active_change, Some(1));
+        assert_eq!(app.active_block_range(), Some((1, 2)));
+    }
+
+    #[test]
+    fn n_crosses_out_of_a_file_that_fits_the_viewport() {
+        // Two short modified files that each fit entirely on screen (max scroll 0).
+        // Navigation must not get stuck re-selecting the first block.
+        let mut app = app_from_files(vec![fits_viewport_file("a.rs"), fits_viewport_file("b.rs")]);
+        app.focus = Focus::Diff;
+        app.diff_height = 24; // both files are far shorter than the viewport
+
+        // First stop is file a's own block; advancing again crosses into file b
+        // (it must not get stuck re-selecting the first block).
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(0));
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(1));
+
+        // Reverse crosses back into file a.
+        press_chars(&mut app, "p");
+        assert_eq!(app.selected, Some(0));
+    }
+
+    #[test]
+    fn n_marks_a_change_at_line_one_in_full_view_before_crossing_files() {
+        let mut app = app_from_files(vec![fits_viewport_file("a.rs"), fits_viewport_file("b.rs")]);
+        app.focus = Focus::Diff;
+        app.view = View::Full;
+        app.diff_height = 24;
+
+        // Full-file anchors are line indices, so a change on line one is at 0.
+        // The first n must select that block instead of skipping to file b.
+        assert_eq!(app.files[0].full_change_anchors(), vec![0]);
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.active_change, Some(0));
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.active_change, Some(0));
+    }
+
+    #[test]
+    fn stray_wheel_event_does_not_strand_change_navigation() {
+        // A viewport-fitting file pins scroll at 0, so navigation cannot rely on
+        // scroll to know which block is current. A wheel event (terminals emit
+        // these around keypresses) must not wipe the marker and trap us in file a.
+        let mut app = app_from_files(vec![fits_viewport_file("a.rs"), fits_viewport_file("b.rs")]);
+        app.focus = Focus::Diff;
+        app.diff_height = 24;
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.active_change, Some(1));
+
+        // Wheel up: scroll is already clamped at 0, so it does not move, but the
+        // marker must survive.
+        app.mouse_scroll(-1);
+        assert_eq!(app.active_change, Some(1));
+
+        // n still advances across the file boundary.
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn n_crosses_into_the_next_file() {
+        let mut app = test_app();
+        app.focus = Focus::Diff;
+
+        // Each fixture file is one addition block anchored at row 1.
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.active_change, Some(1));
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.active_change, Some(1));
+    }
+
+    #[test]
+    fn n_wraps_from_the_last_file_to_the_first_file() {
+        let mut app = test_app();
+        app.focus = Focus::Diff;
+        let last = app.files.len() - 1;
+        app.select_file(last);
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(last));
+
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.active_change, Some(1));
+    }
+
+    #[test]
+    fn p_wraps_from_the_first_file_to_the_last_file() {
+        let mut app = test_app();
+        app.focus = Focus::Diff;
+        press_chars(&mut app, "n");
+        assert_eq!(app.selected, Some(0));
+
+        press_chars(&mut app, "p");
+        assert_eq!(app.selected, Some(app.files.len() - 1));
+        assert_eq!(app.active_change, Some(1));
+    }
+
+    #[test]
+    fn change_navigation_follows_tree_file_order() {
+        // Flat path order is AGENTS, app, bin, ui. The tree sorts directories
+        // before files, so its leaf order is bin, app, ui, AGENTS.
+        let mut app = app_from_files(vec![
+            fits_viewport_file("AGENTS.md"),
+            fits_viewport_file("src/app.rs"),
+            fits_viewport_file("src/bin/diffview-tui.rs"),
+            fits_viewport_file("src/ui.rs"),
+        ]);
+        app.focus = Focus::Diff;
+        app.select_file(2);
+
+        // Mark bin, then walk forward in tree order and wrap.
+        press_chars(&mut app, "n");
+        for expected in [1, 3, 0, 2] {
+            press_chars(&mut app, "n");
+            assert_eq!(app.selected, Some(expected));
+        }
+
+        // Reverse follows the same order back to the tree's last file.
+        press_chars(&mut app, "p");
+        assert_eq!(app.selected, Some(0));
     }
 
     #[test]
@@ -1301,6 +1655,32 @@ mod tests {
         assert!(!app.resizing_tree);
     }
 
+    /// A one-line modified file (`old` -> `new`) whose single change block fits
+    /// any realistic viewport, pinning max scroll at 0.
+    fn fits_viewport_file(path: &str) -> FileEntry {
+        let mut e = FileEntry {
+            path: PathBuf::from(path),
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                kinds: vec!['-', '+'],
+            }],
+            old_lines: vec!["old".to_string()],
+            new_lines: vec!["new".to_string()],
+            rows: Vec::new(),
+            anchors: Vec::new(),
+            change_anchors: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        };
+        e.finalize();
+        e
+    }
+
     fn press_chars(app: &mut App, chars: &str) {
         for c in chars.chars() {
             let code = match c {
@@ -1309,6 +1689,38 @@ mod tests {
             };
             app.on_key(KeyEvent::from(code));
         }
+    }
+
+    /// Single modified file whose one hunk holds two context-separated change
+    /// blocks (anchors at rows 1 and 4), with trailing context so the content is
+    /// taller than the test viewport and both blocks are top-reachable.
+    fn blocks_app() -> App {
+        let to_lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut entry = FileEntry {
+            path: PathBuf::from("src/alpha.rs"),
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 6,
+                kinds: vec!['+', ' ', ' ', '+', ' ', ' '],
+            }],
+            old_lines: to_lines(&["ctx 1", "ctx 2", "ctx 3", "ctx 4"]),
+            new_lines: to_lines(&["add a", "ctx 1", "ctx 2", "add b", "ctx 3", "ctx 4"]),
+            rows: Vec::new(),
+            anchors: Vec::new(),
+            change_anchors: Vec::new(),
+            additions: 0,
+            deletions: 0,
+        };
+        entry.finalize();
+        let mut app = app_from_files(vec![entry]);
+        // Viewport of 2 rows over 7 rows -> max scroll 5, so anchors 1 and 4 are
+        // both reachable as top-aligned positions.
+        app.diff_height = 2;
+        app
     }
 
     fn test_app() -> App {
@@ -1339,12 +1751,18 @@ mod tests {
                 new_lines: lines,
                 rows: Vec::new(),
                 anchors: Vec::new(),
+                change_anchors: Vec::new(),
                 additions: 0,
                 deletions: 0,
             };
             entry.finalize();
             files.push(entry);
         }
+        app_from_files(files)
+    }
+
+    /// Build an `App` around pre-built files without touching git or the disk.
+    fn app_from_files(files: Vec<FileEntry>) -> App {
         let tree = tree::build(&files);
         let tree_rows = tree.flatten();
         App {
@@ -1359,7 +1777,9 @@ mod tests {
             focus: Focus::Tree,
             view: View::Diff,
             scroll: 0,
-            hscroll: 0,
+            active_change: None,
+            hscroll: [0, 0],
+            diff_side: 1,
             diff_height: 24,
             tree_height: 24,
             tree_width: 32,

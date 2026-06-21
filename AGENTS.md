@@ -17,12 +17,18 @@
 - Keep file collection/parsing in `src/git.rs`.
 - Prefer App-level unit tests for keyboard, mouse, search, and navigation behavior.
 - Run `cargo fmt` and `cargo test` before claiming a change is complete.
-- When updating the installed binary, verify `target/release/diffview` and `/Users/bytedance/.local/bin/diffview` have matching hashes.
+- After every completed code change, run `cargo build --release` and copy both
+  `target/release/diffview` and `target/release/diffview-tui` to
+  `/Users/bytedance/.local/bin/`.
+- Before claiming completion, verify both installed binaries have matching hashes
+  with their corresponding files under `target/release/`.
 
 ## Current Interaction Model
 
 - `/` starts search in the currently focused pane.
-- `n` / `N` repeat the active search when a search query exists; otherwise they navigate hunks.
+- `n` / `N` repeat the active search when a search query exists; otherwise `n`
+  jumps to the next change block and `p` / `N` jump to the previous one,
+  wrapping across files.
 - `[` / `]` jump between visible folders.
 - `{` / `}` jump between top-level folders.
 - `H` / `L` scroll code horizontally.

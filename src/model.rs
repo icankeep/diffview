@@ -78,8 +78,10 @@ pub struct FileEntry {
     pub old_lines: Vec<String>,
     pub new_lines: Vec<String>,
     pub rows: Vec<Row>,
-    /// Row index of each hunk header, for n/p navigation.
+    /// Row index of each hunk header.
     pub anchors: Vec<usize>,
+    /// Row index of the first row of each change block, for n/p navigation.
+    pub change_anchors: Vec<usize>,
     pub additions: usize,
     pub deletions: usize,
 }
@@ -100,6 +102,7 @@ impl FileEntry {
             .filter(|&&k| k == '-')
             .count();
         let (rows, anchors) = build_rows(&self.hunks, &self.old_lines, &self.new_lines);
+        self.change_anchors = change_block_anchors(&rows);
         self.rows = rows;
         self.anchors = anchors;
     }
@@ -126,6 +129,29 @@ impl FileEntry {
                 start.saturating_sub(1)
             })
             .collect()
+    }
+
+    /// 0-based line indices of each change block's start within `full_lines()`.
+    pub fn full_change_anchors(&self) -> Vec<usize> {
+        // Deletions show the base text with nothing marked changed, so fall back
+        // to hunk starts to keep navigation stops available.
+        if self.status == FileStatus::Deleted {
+            return self.full_anchors();
+        }
+        let marks = self.changed_full_lines();
+        let mut anchors = Vec::new();
+        let mut in_block = false;
+        for idx in 0..self.full_lines().len() {
+            if marks.contains(&(idx + 1)) {
+                if !in_block {
+                    anchors.push(idx);
+                    in_block = true;
+                }
+            } else {
+                in_block = false;
+            }
+        }
+        anchors
     }
 
     /// 1-based new-file line numbers that were added or changed.
@@ -202,6 +228,30 @@ pub fn build_rows(
         flush_run(&mut rows, &mut dels, &mut adds, old_lines, new_lines);
     }
     (rows, anchors)
+}
+
+/// Row index of the first row of each contiguous run of changed lines. A change
+/// row is any `Row::Line` that is not a context/context pair; hunk headers and
+/// context rows break a run, so adjacent hunks yield separate anchors.
+fn change_block_anchors(rows: &[Row]) -> Vec<usize> {
+    let mut anchors = Vec::new();
+    let mut in_block = false;
+    for (i, row) in rows.iter().enumerate() {
+        let is_change = matches!(
+            row,
+            Row::Line { old, new }
+                if !(old.kind == LineKind::Context && new.kind == LineKind::Context)
+        );
+        if is_change {
+            if !in_block {
+                anchors.push(i);
+                in_block = true;
+            }
+        } else {
+            in_block = false;
+        }
+    }
+    anchors
 }
 
 fn flush_run(
@@ -359,6 +409,22 @@ mod tests {
     }
 
     #[test]
+    fn change_anchors_split_context_separated_runs() {
+        // One hunk with two change runs separated by context lines.
+        let hunks = vec![Hunk {
+            old_start: 1,
+            old_count: 4,
+            new_start: 1,
+            new_count: 4,
+            kinds: vec!['+', ' ', ' ', '+'],
+        }];
+        let new = lines(&["add a", "ctx 1", "ctx 2", "add b"]);
+        let (rows, _) = build_rows(&hunks, &[], &new);
+        // rows: [header, +add a, ctx, ctx, +add b]
+        assert_eq!(change_block_anchors(&rows), vec![1, 4]);
+    }
+
+    #[test]
     fn inline_ranges_word_diff() {
         let (o, n) = inline_ranges("foo bar baz", "foo qux baz");
         assert_eq!(o, vec![(4, 7)]);
@@ -388,6 +454,7 @@ mod tests {
             new_lines: lines(&["keep", "new"]),
             rows: Vec::new(),
             anchors: Vec::new(),
+            change_anchors: Vec::new(),
             additions: 0,
             deletions: 0,
         };

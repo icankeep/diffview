@@ -38,13 +38,6 @@ fn main() -> Result<()> {
         Err(err) => return Err(err),
     };
     let mut app = app::App::new(root, source)?;
-    if app.files.is_empty() {
-        match &app.source {
-            Source::Git { base } => println!("No changes against {base}."),
-            Source::Directory => println!("No files under {}.", app.root.display()),
-        }
-        return Ok(());
-    }
     let mut terminal = ratatui::init();
     ratatui::crossterm::execute!(
         std::io::stdout(),
