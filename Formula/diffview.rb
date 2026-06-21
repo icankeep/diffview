@@ -1,8 +1,8 @@
 class Diffview < Formula
   desc "Open an IDE-style side-by-side git diff viewer in your terminal"
   homepage "https://github.com/icankeep/diffview"
-  url "https://github.com/icankeep/diffview/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "dd2f767a63acaa53798b284cf6bcd7fd5e8c38cc14dd6fd9c9a9e5b14b15d35c"
+  url "https://github.com/icankeep/diffview/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "35f67abb8dc5d123aeb6afe3ddee1819b7b53a4f83de29dd2a0cd53986ee8962"
   license "MIT"
 
   depends_on "rust" => :build
